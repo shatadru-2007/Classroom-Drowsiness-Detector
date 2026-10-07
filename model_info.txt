@@ -1,0 +1,29 @@
+PRETRAINED MODEL
+================
+
+Repository:
+notgoodkeeper/cnn-based-drowsiness-detection
+
+Hugging Face:
+https://huggingface.co/notgoodkeeper/cnn-based-drowsiness-detection
+
+Format:
+ONNX
+
+Runtime:
+ONNX Runtime CPU
+
+Input:
+412 x 412 x 3 RGB
+
+The model card describes the outputs as:
+1. predicted_class
+2. confidence
+3. regressions
+
+The first regression is a normalized drowsiness score.
+
+The model author notes that the training labels are weak/heuristic and that
+the model is a research/portfolio project, not a validated safety system.
+
+This project intentionally does NOT use PyTorch or Ultralytics.

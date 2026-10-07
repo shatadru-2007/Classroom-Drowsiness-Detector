@@ -1,0 +1,29 @@
+SYSTEM ARCHITECTURE
+===================
+
+Webcam
+  |
+  v
+OpenCV frame capture
+  |
+  v
+OpenCV Haar Cascade (pretrained face detector)
+  |
+  +---- Face 1 ----> 412x412 preprocessing ----+
+  +---- Face 2 ----> 412x412 preprocessing ----+--> ONNX Runtime
+  +---- Face 3 ----> 412x412 preprocessing ----+
+  |                                             |
+  +---- ... -----------------------------------+
+                                                |
+                                                v
+                                   Drowsy / Awake per student
+                                                |
+                                                v
+                                  Count detected students
+                                                |
+                                                v
+                       drowsy_count / detected_count > 0.50 ?
+                                      /                 \
+                                    YES                 NO
+                                     |                   |
+                                  Alarm               Normal
