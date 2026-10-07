@@ -1,23 +1,20 @@
-# Classroom Drowsiness Detection — PyTorch-Free ONNX Version
+# Classroom Drowsiness Detector
 
-This version is designed for Windows machines where PyTorch is blocked by an Application Control policy.
+A Flask dashboard for monitoring classroom drowsiness from a webcam or an uploaded video.
 
-## What it does
-- Uses a pretrained ONNX CNN drowsiness model.
-- Uses OpenCV's pretrained Haar face detector to find multiple students.
-- Classifies every detected face as DROWSY or AWAKE.
-- Sounds a Windows alarm when **more than 50%** of detected students are drowsy.
-- Shows the live percentage and per-student result.
-- Uses CPU inference through ONNX Runtime.
-- Does **not** install or import PyTorch, Ultralytics, or TensorFlow.
+## Detection pipeline
+- Uses MediaPipe Face Landmarker to detect and track multiple faces.
+- Estimates eye openness with EAR and drowsiness over time with PERCLOS.
+- Uses head-pose pitch and slouch detection, including severe-slouch fallback.
+- Applies temporal smoothing and maintains per-student tracking and scores.
+- Shows annotated video, student details, classroom statistics, and alarm status.
+- Uses the same `DrowsinessDetector.process_frame()` pipeline for webcam and uploaded-video frames.
 
-The pretrained drowsiness model is:
-`notgoodkeeper/cnn-based-drowsiness-detection`
-
-Model page:
-https://huggingface.co/notgoodkeeper/cnn-based-drowsiness-detection
-
-The model card documents a 412x412x3 ONNX input and a drowsiness-score regression output.
+## Requirements
+- Windows 10/11
+- Python 3.10 or 3.11, 64-bit recommended
+- Webcam for Webcam mode
+- Internet access on first run to download the MediaPipe Face Landmarker asset
 
 ## Requirements
 - Windows 10/11
@@ -27,7 +24,7 @@ The model card documents a 412x412x3 ONNX input and a drowsiness-score regressio
 
 ## Installation
 
-Open Command Prompt in this folder:
+Open PowerShell or Command Prompt in this folder:
 
 ```bat
 python -m venv .venv
@@ -36,29 +33,39 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-Then run:
+Start the dashboard:
 
-```bat
-run_windows.bat
+```powershell
+python app.py
 ```
 
-The first run downloads `models/drowsiness_model.onnx` automatically.
+The dashboard opens at <http://127.0.0.1:5000>. Keep the terminal open while using it. The first run downloads `models/face_landmarker.task` automatically.
+
+## Dashboard modes
+
+Use **Webcam** for the live camera feed, or select **Upload Video** to choose a video file. MP4, AVI, MOV, MKV, and WebM are supported when OpenCV can decode the file.
+
+Uploaded videos are read and processed frame-by-frame; the entire video is not loaded into memory. The annotated frames and student statistics update progressively using the same detection pipeline as Webcam mode.
+
+Upload a file, then use **Start**, **Pause**, **Resume**, **Stop**, and **Restart** to control playback. Progress and the current/total timestamp are shown below the video. Stop preserves the uploaded file so it can be restarted; uploading another file replaces it.
 
 ## Important
 This is a classroom/student project and not a medical or safety-certified system. The underlying model was trained on a relatively small research dataset and its labels are described by the model author as weak/heuristic.
 
-## Controls
-- `Q` = quit
-- `S` = save a screenshot
-- `R` = reset alarm state
+## Webcam dashboard controls
+- **Snapshot** downloads the current webcam frame.
+- **Reset Alarm** resets the webcam alarm state.
+- **Allow Alerts** enables browser notifications for alarm events.
+
+The standalone OpenCV webcam view can also be run with `python main.py`. In that view, `Q` quits, `S` saves a screenshot, and `R` resets the alarm.
 
 ## Alarm rule
 If:
-`drowsy_students / detected_students > 0.50`
+`drowsy_students / detected_students >= 0.50`
 
-then the alarm activates.
+for the configured persistence period, the classroom alarm activates.
 
 Example:
 - 4 students detected, 3 drowsy = 75% → ALARM
-- 4 students detected, 2 drowsy = 50% → NO ALARM
-- 5 students detected, 3 drowsy = 60% → ALARM
+- 4 students detected, 2 drowsy = 50% → ALARM
+- 5 students detected, 2 drowsy = 40% → NO ALARM
