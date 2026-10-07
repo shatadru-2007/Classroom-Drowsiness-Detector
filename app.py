@@ -11,32 +11,18 @@ Routes:
 
 import io
 import json
+import os
 import queue
+import tempfile
 import threading
 import time
-import urllib.request
 from pathlib import Path
 
 import cv2
-import numpy as np
-import onnxruntime as ort
-from flask import Flask, Response, jsonify, send_file
+from flask import Flask, Response, jsonify, request, send_file
+from werkzeug.utils import secure_filename
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-MODEL_URL = (
-    "https://huggingface.co/notgoodkeeper/"
-    "cnn-based-drowsiness-detection/resolve/main/model.onnx"
-)
-MODEL_PATH = Path("models/drowsiness_model.onnx")
-
-INPUT_SIZE = 412
-DROWSY_THRESHOLD = 0.50
-ALARM_THRESHOLD = 0.50
-MIN_FACE_SIZE = (55, 55)
-
-CASCADE_PATH = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+from drowsiness_core import DrowsinessDetector, ensure_model
 
 # ---------------------------------------------------------------------------
 # Shared state
@@ -60,106 +46,43 @@ _frame_lock = threading.Lock()
 
 _stats_queue: queue.Queue = queue.Queue(maxsize=60)
 _alarm_reset_event = threading.Event()
+_webcam_enabled = threading.Event()
+_webcam_enabled.set()
 
-# ---------------------------------------------------------------------------
-# Model helpers
-# ---------------------------------------------------------------------------
-
-def ensure_model():
-    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    if MODEL_PATH.exists() and MODEL_PATH.stat().st_size > 1_000_000:
-        return
-    print("Downloading ONNX model from Hugging Face…")
-    urllib.request.urlretrieve(MODEL_URL, str(MODEL_PATH))
-    if MODEL_PATH.stat().st_size < 1_000_000:
-        raise RuntimeError("Downloaded model file appears incomplete.")
-
-
-def make_session():
-    return ort.InferenceSession(str(MODEL_PATH), providers=["CPUExecutionProvider"])
-
-
-def preprocess(face_bgr):
-    gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.resize(gray, (INPUT_SIZE, INPUT_SIZE), interpolation=cv2.INTER_AREA)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    gray = clahe.apply(gray)
-    rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
-    tensor = rgb.astype(np.float32) / 255.0
-    tensor = np.transpose(tensor, (2, 0, 1))[None, ...]
-    return tensor
-
-
-def scalar_from_output(value):
-    arr = np.asarray(value).squeeze()
-    if arr.size == 1:
-        return float(arr.reshape(-1)[0])
-    return arr
-
-
-def classify_face(session, face_bgr):
-    input_name = session.get_inputs()[0].name
-    tensor = preprocess(face_bgr)
-    outputs = session.run(None, {input_name: tensor})
-
-    drowsy_score = predicted_class = confidence = None
-
-    if len(outputs) >= 1:
-        predicted_class = scalar_from_output(outputs[0])
-    if len(outputs) >= 2:
-        confidence = scalar_from_output(outputs[1])
-    if len(outputs) >= 3:
-        reg = np.asarray(outputs[2]).reshape(-1)
-        if reg.size >= 1:
-            drowsy_score = float(reg[0])
-
-    if drowsy_score is not None and np.isfinite(drowsy_score):
-        drowsy = drowsy_score >= DROWSY_THRESHOLD
-        score = drowsy_score
-    else:
-        pc = float(np.asarray(predicted_class).reshape(-1)[0])
-        conf = (float(np.asarray(confidence).reshape(-1)[0])
-                if confidence is not None else 1.0)
-        drowsy = pc > 0.5
-        score = conf if drowsy else 1.0 - conf
-
-    return drowsy, float(score)
+_video_state = {
+    "detected": 0,
+    "drowsy": 0,
+    "awake": 0,
+    "percentage": 0.0,
+    "alarm": False,
+    "status": "empty",
+    "error": None,
+    "faces": [],
+    "frame": 0,
+    "position": 0.0,
+    "duration": 0.0,
+    "progress": 0.0,
+}
+_video_state_lock = threading.Lock()
+_video_frame_lock = threading.Lock()
+_video_control_lock = threading.RLock()
+_video_latest_frame: bytes = b""
+_video_path: Path | None = None
+_video_thread: threading.Thread | None = None
+_video_play_event = threading.Event()
+_video_stop_event = threading.Event()
+_VIDEO_EXTENSIONS = {".avi", ".mkv", ".mov", ".mp4", ".webm"}
 
 
 # ---------------------------------------------------------------------------
 # Detection thread
 # ---------------------------------------------------------------------------
 
-def _draw_overlay(display, detected, drowsy_count, percentage, alarm_on):
-    h, w = display.shape[:2]
-    # Bottom status bar
-    overlay = display.copy()
-    cv2.rectangle(overlay, (0, h - 56), (w, h), (10, 10, 20), -1)
-    cv2.addWeighted(overlay, 0.75, display, 0.25, 0, display)
-    status_text = (
-        f"Detected: {detected}   Drowsy: {drowsy_count}   "
-        f"Awake: {detected - drowsy_count}   Ratio: {percentage:.0%}"
-    )
-    cv2.putText(display, status_text, (16, h - 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.60, (180, 180, 255), 2)
-    if alarm_on:
-        cv2.rectangle(display, (0, 0), (w - 1, h - 1), (0, 0, 255), 10)
-        banner_overlay = display.copy()
-        cv2.rectangle(banner_overlay, (0, 0), (w, 52), (0, 0, 180), -1)
-        cv2.addWeighted(banner_overlay, 0.65, display, 0.35, 0, display)
-        cv2.putText(display, "! CLASSROOM DROWSINESS ALERT > 50% !",
-                    (16, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.85,
-                    (255, 220, 50), 2)
-
-
 def detection_thread():
     global _latest_frame, _snapshot_frame
     try:
         ensure_model()
-        session = make_session()
-        face_detector = cv2.CascadeClassifier(CASCADE_PATH)
-        if face_detector.empty():
-            raise RuntimeError("Haar face detector could not be loaded.")
+        detector = DrowsinessDetector()
 
         cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
         if not cap.isOpened():
@@ -177,6 +100,9 @@ def detection_thread():
         frame_count = 0
 
         while True:
+            if not _webcam_enabled.wait(timeout=0.1):
+                continue
+
             if _alarm_reset_event.is_set():
                 alarm_active = False
                 _alarm_reset_event.clear()
@@ -186,66 +112,20 @@ def detection_thread():
                 break
 
             frame_count += 1
-            display = frame.copy()
 
-            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = face_detector.detectMultiScale(
-                gray_frame, scaleFactor=1.08, minNeighbors=5, minSize=MIN_FACE_SIZE
-            )
+            # Process frame through MediaPipe + EAR + PERCLOS + SolvePnP pipeline
+            res = detector.process_frame(frame)
+            display = res["frame"]
 
-            drowsy_count = 0
-            detected_count = len(faces)
-            face_results = []
-
-            for idx, (x, y, w, h) in enumerate(faces, start=1):
-                pad_x = int(w * 0.15)
-                pad_top = int(h * 0.20)
-                pad_bottom = int(h * 0.10)
-                x1 = max(0, x - pad_x)
-                y1 = max(0, y - pad_top)
-                x2 = min(frame.shape[1], x + w + pad_x)
-                y2 = min(frame.shape[0], y + h + pad_bottom)
-                face_crop = frame[y1:y2, x1:x2]
-                if face_crop.size == 0:
-                    continue
-
-                try:
-                    drowsy, score = classify_face(session, face_crop)
-                except Exception:
-                    continue
-
-                if drowsy:
-                    drowsy_count += 1
-                    box_color = (50, 50, 255)
-                    status_label = "DROWSY"
-                else:
-                    box_color = (50, 210, 50)
-                    status_label = "AWAKE"
-
-                face_results.append({
-                    "id": idx,
-                    "label": f"Student {idx}",
-                    "status": status_label,
-                    "score": round(score * 100, 1),
-                })
-
-                cv2.rectangle(display, (x, y), (x + w, y + h), box_color, 2)
-                label = f"S{idx}: {status_label} {score:.0%}"
-                cv2.putText(display, label, (x, max(25, y - 8)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, box_color, 2)
-
-            percentage = drowsy_count / detected_count if detected_count else 0.0
-            alarm_on = detected_count > 0 and percentage > ALARM_THRESHOLD
-
-            if alarm_on and not alarm_active:
-                alarm_active = True
-            elif not alarm_on:
+            if _alarm_reset_event.is_set():
                 alarm_active = False
-
-            _draw_overlay(display, detected_count, drowsy_count, percentage, alarm_on)
+                res["alarm"] = False
+                _alarm_reset_event.clear()
+            else:
+                alarm_active = res["alarm"]
 
             _, jpeg = cv2.imencode(
-                ".jpg", display, [cv2.IMWRITE_JPEG_QUALITY, 82]
+                ".jpg", display, [cv2.IMWRITE_JPEG_QUALITY, 85]
             )
             jpeg_bytes = jpeg.tobytes()
 
@@ -254,13 +134,13 @@ def detection_thread():
                 _snapshot_frame = jpeg_bytes
 
             stats = {
-                "detected": detected_count,
-                "drowsy": drowsy_count,
-                "awake": detected_count - drowsy_count,
-                "percentage": round(percentage * 100, 1),
-                "alarm": alarm_on,
+                "detected": res["detected"],
+                "drowsy": res["drowsy"],
+                "awake": res["awake"],
+                "percentage": round(res["percentage"], 1),
+                "alarm": alarm_active,
                 "frame": frame_count,
-                "faces": face_results,
+                "faces": res["faces"],
                 "ts": time.time(),
             }
             with _state_lock:
@@ -278,13 +158,125 @@ def detection_thread():
         with _state_lock:
             _state["error"] = str(exc)
             _state["running"] = False
-        print(f"Detection error: {exc}")
+        print(f"Detection thread error: {exc}")
+
+
+def _process_uploaded_video(video_path: Path):
+    global _video_latest_frame
+    capture = None
+    detector = None
+    try:
+        capture = cv2.VideoCapture(str(video_path))
+        if not capture.isOpened():
+            raise RuntimeError("OpenCV could not open this video.")
+
+        fps = capture.get(cv2.CAP_PROP_FPS)
+        fps = fps if fps and fps > 0 else 30.0
+        total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        duration = total_frames / fps if total_frames > 0 else 0.0
+
+        ensure_model()
+        detector = DrowsinessDetector()
+        with _video_state_lock:
+            _video_state.update({"duration": duration, "status": "running" if _video_play_event.is_set() else "paused"})
+
+        frame_number = 0
+        while not _video_stop_event.is_set():
+            if not _video_play_event.wait(timeout=0.1):
+                continue
+
+            frame_started = time.monotonic()
+            ok, frame = capture.read()
+            if not ok:
+                with _video_state_lock:
+                    _video_state.update({"status": "finished", "position": duration, "progress": 100.0 if duration else 0.0})
+                break
+
+            # Use the same detector pipeline as the webcam worker.
+            result = detector.process_frame(frame)
+            encoded, jpeg = cv2.imencode(".jpg", result["frame"], [cv2.IMWRITE_JPEG_QUALITY, 85])
+            if not encoded:
+                raise RuntimeError("Could not encode a processed video frame.")
+
+            frame_number += 1
+            position = capture.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            if position <= 0:
+                position = frame_number / fps
+            progress = min(100.0, position / duration * 100.0) if duration > 0 else 0.0
+            stats = {
+                "detected": result["detected"],
+                "drowsy": result["drowsy"],
+                "awake": result["awake"],
+                "percentage": round(result["percentage"], 1),
+                "alarm": result["alarm"],
+                "status": "running" if _video_play_event.is_set() else "paused",
+                "error": None,
+                "faces": result["faces"],
+                "frame": frame_number,
+                "position": position,
+                "duration": duration,
+                "progress": progress,
+            }
+            with _video_frame_lock:
+                _video_latest_frame = jpeg.tobytes()
+            with _video_state_lock:
+                _video_state.update(stats)
+
+            frame_delay = max(0.0, (1.0 / fps) - (time.monotonic() - frame_started))
+            if frame_delay:
+                _video_stop_event.wait(frame_delay)
+
+    except Exception as exc:
+        with _video_state_lock:
+            _video_state.update({"status": "error", "error": str(exc), "alarm": False})
+    finally:
+        if capture is not None:
+            capture.release()
+        if detector is not None:
+            detector.landmarker.close()
+        if _video_stop_event.is_set():
+            with _video_state_lock:
+                _video_state.update({"status": "stopped", "alarm": False})
+
+
+def _start_video_worker():
+    global _video_thread
+    with _video_control_lock:
+        if _video_path is None:
+            return False, "Upload a video first."
+        if _video_thread is not None and _video_thread.is_alive():
+            _video_play_event.set()
+            with _video_state_lock:
+                _video_state.update({"status": "running", "error": None})
+            return True, None
+
+        _video_stop_event.clear()
+        _video_play_event.set()
+        _video_thread = threading.Thread(
+            target=_process_uploaded_video,
+            args=(_video_path,),
+            daemon=True,
+        )
+        _video_thread.start()
+        with _video_state_lock:
+            _video_state.update({"status": "running", "error": None})
+        return True, None
+
+
+def _generate_uploaded_mjpeg():
+    while True:
+        with _video_frame_lock:
+            frame = _video_latest_frame
+        if frame:
+            yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+        time.sleep(0.033)
 
 
 # ---------------------------------------------------------------------------
 # Flask app
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024 * 1024
 _UI_HTML = (Path(__file__).with_name("ui.html")).read_text(encoding="utf-8")
 
 
@@ -310,6 +302,184 @@ def video_feed():
     return Response(
         _generate_mjpeg(),
         mimetype="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.route("/video/upload", methods=["POST"])
+def upload_video():
+    global _video_path, _video_latest_frame
+    uploaded = request.files.get("video")
+    if uploaded is None or not uploaded.filename:
+        return jsonify({"error": "Choose a video file to upload."}), 400
+
+    filename = secure_filename(uploaded.filename)
+    suffix = Path(filename).suffix.lower()
+    if suffix not in _VIDEO_EXTENSIONS:
+        return jsonify({"error": "Use an MP4, AVI, MOV, MKV, or WebM video."}), 400
+
+    if not _halt_uploaded_video():
+        return jsonify({"error": "The current video is still stopping. Try again shortly."}), 409
+
+    temp_path = None
+    try:
+        handle, temp_name = tempfile.mkstemp(prefix="drowsiness-video-", suffix=suffix)
+        os.close(handle)
+        temp_path = Path(temp_name)
+        uploaded.save(temp_path)
+        if temp_path.stat().st_size == 0:
+            raise ValueError("The uploaded file is empty.")
+    except Exception as exc:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        return jsonify({"error": str(exc)}), 400
+
+    old_path = _video_path
+    _video_path = temp_path
+    if old_path is not None:
+        old_path.unlink(missing_ok=True)
+    with _video_frame_lock:
+        _video_latest_frame = b""
+    with _video_state_lock:
+        _video_state.update({
+            "detected": 0,
+            "drowsy": 0,
+            "awake": 0,
+            "percentage": 0.0,
+            "alarm": False,
+            "status": "ready",
+            "error": None,
+            "faces": [],
+            "frame": 0,
+            "position": 0.0,
+            "duration": 0.0,
+            "progress": 0.0,
+            "filename": filename,
+        })
+    return jsonify({"ok": True, "filename": filename})
+
+
+def _halt_uploaded_video():
+    global _video_thread
+    with _video_control_lock:
+        worker = _video_thread
+        _video_stop_event.set()
+        _video_play_event.set()
+    if worker is not None and worker.is_alive():
+        worker.join(timeout=5.0)
+        if worker.is_alive():
+            return False
+    with _video_control_lock:
+        if _video_thread is worker:
+            _video_thread = None
+        _video_stop_event.clear()
+        _video_play_event.clear()
+    return True
+
+
+@app.route("/video/start", methods=["POST"])
+def start_video():
+    started, error = _start_video_worker()
+    if not started:
+        return jsonify({"error": error}), 400
+    return jsonify({"ok": True})
+
+
+@app.route("/video/pause", methods=["POST"])
+def pause_video():
+    _video_play_event.clear()
+    with _video_state_lock:
+        if _video_state["status"] == "running":
+            _video_state["status"] = "paused"
+    return jsonify({"ok": True})
+
+
+@app.route("/video/resume", methods=["POST"])
+def resume_video():
+    started, error = _start_video_worker()
+    if not started:
+        return jsonify({"error": error}), 400
+    return jsonify({"ok": True})
+
+
+@app.route("/video/stop", methods=["POST"])
+def stop_video():
+    if not _halt_uploaded_video():
+        return jsonify({"error": "The video is still stopping. Try again shortly."}), 409
+    with _video_state_lock:
+        if _video_path is None:
+            _video_state["status"] = "empty"
+        else:
+            _video_state.update({"status": "stopped", "position": 0.0, "progress": 0.0, "alarm": False})
+    return jsonify({"ok": True})
+
+
+@app.route("/video/restart", methods=["POST"])
+def restart_video():
+    global _video_latest_frame
+    if not _halt_uploaded_video():
+        return jsonify({"error": "The video is still stopping. Try again shortly."}), 409
+    if _video_path is None:
+        return jsonify({"error": "Upload a video first."}), 400
+    with _video_frame_lock:
+        _video_latest_frame = b""
+    with _video_state_lock:
+        _video_state.update({
+            "detected": 0,
+            "drowsy": 0,
+            "awake": 0,
+            "percentage": 0.0,
+            "alarm": False,
+            "status": "ready",
+            "error": None,
+            "faces": [],
+            "frame": 0,
+            "position": 0.0,
+            "progress": 0.0,
+        })
+    started, error = _start_video_worker()
+    if not started:
+        return jsonify({"error": error}), 400
+    return jsonify({"ok": True})
+
+
+@app.route("/video/state")
+def video_state():
+    with _video_state_lock:
+        return jsonify(dict(_video_state))
+
+
+@app.route("/mode/<source>", methods=["POST"])
+def set_mode(source):
+    if source == "webcam":
+        _webcam_enabled.set()
+    elif source == "video":
+        _webcam_enabled.clear()
+    else:
+        return jsonify({"error": "Unknown video source."}), 400
+    return jsonify({"ok": True})
+
+
+@app.route("/video/feed")
+def uploaded_video_feed():
+    return Response(
+        _generate_uploaded_mjpeg(),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.route("/video/stats")
+def uploaded_video_stats():
+    def generate():
+        while True:
+            with _video_state_lock:
+                stats = dict(_video_state)
+            yield f"data: {json.dumps(stats)}\n\n"
+            time.sleep(0.2)
+
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

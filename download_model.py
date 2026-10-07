@@ -2,18 +2,18 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 MODEL_URL = (
-    "https://huggingface.co/notgoodkeeper/"
-    "cnn-based-drowsiness-detection/resolve/main/model.onnx"
+    "https://storage.googleapis.com/mediapipe-models/"
+    "face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
 )
-MODEL_PATH = Path("models/drowsiness_model.onnx")
+MODEL_PATH = Path("models/face_landmarker.task")
 
 def download():
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    if MODEL_PATH.exists() and MODEL_PATH.stat().st_size > 1_000_000:
-        print(f"Model already exists: {MODEL_PATH}")
+    if MODEL_PATH.exists() and MODEL_PATH.stat().st_size > 500_000:
+        print(f"Model asset already exists: {MODEL_PATH}")
         return
 
-    print("Downloading pretrained ONNX drowsiness model...")
+    print("Downloading MediaPipe Face Landmarker model asset...")
     print(MODEL_URL)
     req = Request(MODEL_URL, headers={"User-Agent": "ClassroomDrowsiness/1.0"})
     with urlopen(req, timeout=60) as response, open(MODEL_PATH, "wb") as out:

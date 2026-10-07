@@ -105,6 +105,32 @@
       display: flex; gap: 8px; margin-left: 16px;
     }
 
+    .mode-switch {
+      display: flex;
+      gap: 2px;
+      margin-left: 18px;
+      padding: 3px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      background: #0b0d14;
+    }
+
+    .mode-btn {
+      border: 0;
+      border-radius: 5px;
+      padding: 5px 9px;
+      background: transparent;
+      color: var(--muted);
+      font: 500 11px 'Inter', sans-serif;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    .mode-btn.active {
+      background: var(--accent);
+      color: #fff;
+    }
+
     .btn {
       display: flex; align-items: center; gap: 6px;
       padding: 5px 12px;
@@ -154,6 +180,66 @@
       animation: spin 0.9s linear infinite;
     }
     .feed-placeholder p { color: var(--muted); font-size: 13px; }
+
+    .video-controls {
+      position: absolute;
+      z-index: 3;
+      left: 50%;
+      bottom: 16px;
+      width: min(780px, calc(100% - 32px));
+      padding: 12px;
+      border: 1px solid #ffffff26;
+      border-radius: var(--radius-sm);
+      background: #12151feF;
+      box-shadow: 0 8px 32px #0009;
+      transform: translateX(-50%);
+    }
+
+    .video-control-row {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 7px;
+    }
+
+    .video-control-row input[type="file"] {
+      flex: 1 1 190px;
+      min-width: 0;
+      color: var(--muted);
+      font: 11px 'Inter', sans-serif;
+    }
+
+    .video-control-row input[type="file"]::file-selector-button {
+      margin-right: 8px;
+      padding: 6px 9px;
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      background: var(--card);
+      color: var(--text);
+      font: 500 11px 'Inter', sans-serif;
+      cursor: pointer;
+    }
+
+    .video-control-row .btn { padding: 6px 9px; }
+    .video-control-row .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .video-progress-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      align-items: center;
+      gap: 10px;
+      margin-top: 10px;
+      color: var(--muted);
+      font: 11px 'JetBrains Mono', monospace;
+    }
+
+    #video-progress {
+      width: 100%;
+      height: 6px;
+      accent-color: var(--accent);
+    }
+
+    #video-status { color: var(--text); }
 
     @keyframes spin { to { transform: rotate(360deg); } }
 
@@ -308,6 +394,10 @@
       border-color: #7f1d1d;
       background: #1a0b0b;
     }
+    .student-card.slouch-card {
+      border-color: #c2410c;
+      background: #1c0d02;
+    }
     .student-card.awake-card {
       border-color: #14532d;
       background: #0b1a0f;
@@ -321,6 +411,7 @@
       flex-shrink: 0;
     }
     .drowsy-card .student-avatar { background: #7f1d1d; color: #fca5a5; }
+    .slouch-card .student-avatar { background: #9a3412; color: #ffedd5; }
     .awake-card  .student-avatar { background: #14532d; color: #86efac; }
 
     .student-info { flex: 1; min-width: 0; }
@@ -332,6 +423,7 @@
       font-size: 11px; font-weight: 600;
     }
     .drowsy-card .student-score { color: var(--drowsy); }
+    .slouch-card .student-score { color: #f97316; }
     .awake-card  .student-score { color: var(--awake); }
 
     /* ───── Notification toast ───── */
@@ -378,6 +470,11 @@
     <div class="logo-icon">👁️</div>
     <h1>Classroom Drowsiness Detector</h1>
 
+    <div class="mode-switch" role="tablist" aria-label="Detection source">
+      <button class="mode-btn active" id="mode-webcam" role="tab" aria-selected="true">Webcam</button>
+      <button class="mode-btn" id="mode-video" role="tab" aria-selected="false">Upload Video</button>
+    </div>
+
     <div class="header-badges">
       <span class="badge live" id="badge-live">
         <span class="dot"></span> Live
@@ -407,9 +504,22 @@
       <p>Connecting to camera…</p>
     </div>
     <img id="feed" src="/video_feed" alt="Live classroom feed"
-         style="display:none"
-         onload="document.getElementById('feed-placeholder').style.display='none';
-                 document.getElementById('feed').style.display='block';" />
+          style="display:none" />
+    <div class="video-controls" id="video-controls" hidden>
+      <div class="video-control-row">
+        <input id="video-file" type="file" accept=".mp4,.avi,.mov,.mkv,.webm,video/mp4,video/avi,video/quicktime,video/x-msvideo,video/webm" />
+        <button class="btn" id="video-upload">Upload</button>
+        <button class="btn" id="video-start" disabled>Start</button>
+        <button class="btn" id="video-pause" disabled>Pause</button>
+        <button class="btn" id="video-resume" disabled>Resume</button>
+        <button class="btn btn-danger" id="video-stop" disabled>Stop</button>
+        <button class="btn" id="video-restart" disabled>Restart</button>
+      </div>
+      <div class="video-progress-row">
+        <progress id="video-progress" max="100" value="0"></progress>
+        <span><span id="video-time">00:00 / 00:00</span> · <span id="video-status">Choose a video</span></span>
+      </div>
+    </div>
     <div class="alarm-overlay" id="alarm-overlay"></div>
   </div>
 
@@ -506,6 +616,7 @@
   const badgeAlarm   = document.getElementById('badge-alarm');
   const studentsList = document.getElementById('students-list');
   const noStudents   = document.getElementById('no-students');
+  const badgeLive    = document.getElementById('badge-live');
 
   let lastAlarmState = false;
 
@@ -576,6 +687,7 @@
     // Update or add
     faces.forEach(f => {
       const isDrowsy = f.status === 'DROWSY';
+      const isSlouch = f.status.includes('SLOUCH');
       const id = String(f.id);
       let card = studentsList.querySelector(`.student-card[data-id="${id}"]`);
 
@@ -593,8 +705,8 @@
         studentsList.appendChild(card);
       }
 
-      card.className = `student-card ${isDrowsy ? 'drowsy-card' : 'awake-card'}`;
-      card.querySelector('.student-status').textContent = f.status;
+      card.className = `student-card ${isDrowsy ? 'drowsy-card' : isSlouch ? 'slouch-card' : 'awake-card'}`;
+      card.querySelector('.student-status').textContent = isSlouch ? 'SEVERE SLOUCH → DROWSY' : f.status;
       card.querySelector('.student-score').textContent  = f.score.toFixed(1) + '%';
     });
   }
@@ -641,17 +753,152 @@
   }
 
   // ── SSE connection ────────────────────────────────────────────────────────
-  function connectSSE() {
-    const es = new EventSource('/stats');
+  let statsSource;
+  function connectSSE(path = '/stats') {
+    if (statsSource) statsSource.close();
+    const es = new EventSource(path);
+    statsSource = es;
     es.onmessage = e => {
-      try { updateUI(JSON.parse(e.data)); } catch(_) {}
+      try {
+        const data = JSON.parse(e.data);
+        updateUI(data);
+        if (path === '/video/stats') updateVideoStatus(data);
+      } catch(_) {}
     };
     es.onerror = () => {
       es.close();
-      setTimeout(connectSSE, 3000); // reconnect
+      if (statsSource === es) setTimeout(() => connectSSE(path), 3000);
     };
   }
   connectSSE();
+
+  // ── Source selection and uploaded-video controls ─────────────────────────
+  const feed = document.getElementById('feed');
+  const placeholder = document.getElementById('feed-placeholder');
+  const uploadControls = document.getElementById('video-controls');
+  const videoFile = document.getElementById('video-file');
+  const videoButtons = {
+    upload: document.getElementById('video-upload'),
+    start: document.getElementById('video-start'),
+    pause: document.getElementById('video-pause'),
+    resume: document.getElementById('video-resume'),
+    stop: document.getElementById('video-stop'),
+    restart: document.getElementById('video-restart'),
+  };
+  let selectedMode = 'webcam';
+  let hasUploadedVideo = false;
+
+  function setVideoMessage(message) {
+    placeholder.querySelector('p').textContent = message;
+    placeholder.style.display = 'flex';
+    feed.style.display = 'none';
+  }
+
+  async function chooseMode(mode) {
+    selectedMode = mode;
+    const isVideo = mode === 'video';
+    document.getElementById('mode-webcam').classList.toggle('active', !isVideo);
+    document.getElementById('mode-video').classList.toggle('active', isVideo);
+    document.getElementById('mode-webcam').setAttribute('aria-selected', String(!isVideo));
+    document.getElementById('mode-video').setAttribute('aria-selected', String(isVideo));
+    badgeLive.lastChild.textContent = isVideo ? ' Video' : ' Live';
+    badgeLive.classList.toggle('live', !isVideo);
+    uploadControls.hidden = !isVideo;
+    document.getElementById('btn-snapshot').style.display = isVideo ? 'none' : '';
+    document.getElementById('btn-reset').style.display = isVideo ? 'none' : '';
+    await fetch(`/mode/${mode}`, { method: 'POST' });
+
+    if (isVideo) {
+      connectSSE('/video/stats');
+      if (hasUploadedVideo) {
+        feed.src = `/video/feed?mode=${Date.now()}`;
+        setVideoMessage('Waiting for processed video frames…');
+      } else {
+        setVideoMessage('Upload a video to begin');
+      }
+    } else {
+      connectSSE('/stats');
+      placeholder.querySelector('p').textContent = 'Connecting to camera…';
+      placeholder.style.display = 'flex';
+      feed.style.display = 'block';
+      feed.src = `/video_feed?mode=${Date.now()}`;
+    }
+  }
+
+  document.getElementById('mode-webcam').addEventListener('click', () => chooseMode('webcam'));
+  document.getElementById('mode-video').addEventListener('click', () => chooseMode('video'));
+
+  feed.addEventListener('load', () => {
+    if (selectedMode === 'video' && !hasUploadedVideo) return;
+    placeholder.style.display = 'none';
+    feed.style.display = 'block';
+  });
+
+  function formatTime(seconds) {
+    if (!Number.isFinite(seconds) || seconds < 0) return '00:00';
+    const whole = Math.floor(seconds);
+    return `${String(Math.floor(whole / 60)).padStart(2, '0')}:${String(whole % 60).padStart(2, '0')}`;
+  }
+
+  function updateVideoStatus(data) {
+    const status = data.status || 'ready';
+    badgeLive.lastChild.textContent = status === 'running' ? ' Processing' : ' Video';
+    badgeLive.classList.toggle('live', status === 'running');
+    document.getElementById('video-progress').value = data.progress || 0;
+    document.getElementById('video-time').textContent = `${formatTime(data.position)} / ${formatTime(data.duration)}`;
+    document.getElementById('video-status').textContent = data.error || status;
+    const ready = hasUploadedVideo;
+    videoButtons.start.disabled = !ready || ['running', 'finished', 'error'].includes(status);
+    videoButtons.pause.disabled = !ready || status !== 'running';
+    videoButtons.resume.disabled = !ready || status !== 'paused';
+    videoButtons.stop.disabled = !ready || ['stopped', 'finished', 'ready', 'empty'].includes(status);
+    videoButtons.restart.disabled = !ready;
+  }
+
+  async function videoAction(action) {
+    const response = await fetch(`/video/${action}`, { method: 'POST' });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'Video action failed.');
+    if (['start', 'resume', 'restart'].includes(action)) {
+      feed.src = `/video/feed?play=${Date.now()}`;
+      setVideoMessage('Waiting for processed video frames…');
+    }
+    return data;
+  }
+
+  videoButtons.upload.addEventListener('click', async () => {
+    const file = videoFile.files[0];
+    if (!file) {
+      document.getElementById('video-status').textContent = 'Choose a video first';
+      return;
+    }
+    videoButtons.upload.disabled = true;
+    try {
+      const body = new FormData();
+      body.append('video', file);
+      const response = await fetch('/video/upload', { method: 'POST', body });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Upload failed.');
+      hasUploadedVideo = true;
+      updateVideoStatus({ status: 'ready', position: 0, duration: 0, progress: 0 });
+      document.getElementById('video-status').textContent = `Ready: ${data.filename}`;
+      setVideoMessage('Video uploaded. Press Start to process.');
+    } catch (error) {
+      document.getElementById('video-status').textContent = error.message;
+    } finally {
+      videoButtons.upload.disabled = false;
+    }
+  });
+
+  for (const action of ['start', 'pause', 'resume', 'stop', 'restart']) {
+    videoButtons[action].addEventListener('click', async () => {
+      try {
+        await videoAction(action);
+      } catch (error) {
+        document.getElementById('video-status').textContent = error.message;
+      }
+    });
+  }
 
   // ── Buttons ───────────────────────────────────────────────────────────────
   document.getElementById('btn-reset').addEventListener('click', async () => {
