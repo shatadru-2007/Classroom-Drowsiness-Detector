@@ -572,7 +572,7 @@
       <!-- Alarm banner -->
       <div class="alarm-banner" id="alarm-banner">
         <span class="alarm-icon">🚨</span>
-        <span>ALERT: &gt;50% students drowsy!</span>
+        <span>ALERT: &gt;=40% students drowsy!</span>
       </div>
     </div>
 
@@ -633,7 +633,7 @@
     const filled = (pct / 100) * arcCircumference;
     arcRing.style.strokeDashoffset = arcCircumference - filled;
 
-    if (pct > 50) {
+    if (pct >= 40) {
       arcRing.style.stroke = '#ef4444';
       ratioPct.style.color = '#ef4444';
     } else if (pct > 25) {

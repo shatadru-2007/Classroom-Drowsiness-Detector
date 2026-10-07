@@ -16,6 +16,7 @@ Pipeline features:
 """
 
 import math
+import threading
 import time
 import urllib.request
 from collections import deque
@@ -54,7 +55,33 @@ MAX_MATCH_DISTANCE_PX = 150.0
 SLOUCH_PERSISTENCE_FRAMES = 150  # ~5 seconds of sustained slouching required
 SLOUCH_DOWNWARD_SHIFT_PX = 20.0  # minimum downward pixel displacement threshold
 
-ALARM_THRESHOLD_PERCENT = 0.50  # > 50% students drowsy triggers alarm
+# --- Small-face (classroom camera) detection -------------------------------
+# MediaPipe's built-in face detector downsizes the whole frame to a tiny input,
+# so faces narrower than ~10% of the frame width are never found. We therefore
+# (a) scan overlapping, upscaled tiles to DISCOVER faces every few frames and
+# (b) re-run the landmarker on an upscaled crop around each KNOWN face every frame.
+DISCOVERY_INTERVAL_FRAMES = 30      # how often to start a (background) tiled scan
+ROI_REFRESH_FRAMES = 3              # re-run landmarks on each tracked face every N frames
+TILE_FRACTIONS = (0.20, 0.35)       # tile width as a fraction of frame width
+TILE_OVERLAP = 0.5
+TILE_INPUT_SIZE = 720               # tiles are resized to this before detection
+ROI_MARGIN = 0.8                    # crop margin around a tracked face (x face size)
+ROI_INPUT_SIZE = 320                # tracked-face crops are resized to this
+MIN_FACE_PX = 10                    # reject detections narrower than this
+
+# On-face drowsiness score (%) thresholds - these decide DROWSY / AWAKE
+SCORE_DROWSY_THRESHOLD = 70.0   # AWAKE -> DROWSY when score >= this
+SCORE_AWAKE_THRESHOLD = 60.0    # DROWSY -> AWAKE when score < this (60-70 = hold zone)
+MIN_FRAMES_FOR_DECISION = 30    # warm-up: ignore the score for a new student's first ~1 s
+
+# Closed / lowered eyes with an UPRIGHT head usually means "looking down at a book",
+# not sleeping. When enabled, eye closure only counts once the head has also sagged
+# by HEAD_DROP_DEG below that student's own upright posture.
+REQUIRE_HEAD_DROP_FOR_EYES = True
+HEAD_DROP_DEG = 12.0            # degrees below own upright pitch = "head has dropped"
+HEAD_BASELINE_FRAMES = 30       # frames used to learn each student's upright pitch
+
+ALARM_THRESHOLD_PERCENT = 0.40  # > 40% students drowsy triggers alarm
 ALARM_PERSISTENCE_FRAMES = 90   # ~3 seconds sustained before triggering global alarm
 
 # MediaPipe 468 landmark indices
@@ -197,6 +224,29 @@ def check_head_silhouette_enhanced(frame_bgr, roi_box):
     return is_head_visible, score
 
 
+
+def _face_box(pts):
+    return (float(pts[:, 0].min()), float(pts[:, 1].min()),
+            float(pts[:, 0].max()), float(pts[:, 1].max()))
+
+
+def _is_duplicate_face(box_a, box_b):
+    """True if two face boxes overlap enough to be the same face."""
+    ix = max(0.0, min(box_a[2], box_b[2]) - max(box_a[0], box_b[0]))
+    iy = max(0.0, min(box_a[3], box_b[3]) - max(box_a[1], box_b[1]))
+    inter = ix * iy
+    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
+    area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
+    union = area_a + area_b - inter
+    if union > 0 and inter / union > 0.30:
+        return True
+    ca = ((box_a[0] + box_a[2]) / 2.0, (box_a[1] + box_a[3]) / 2.0)
+    cb = ((box_b[0] + box_b[2]) / 2.0, (box_b[1] + box_b[3]) / 2.0)
+    min_side = min(box_a[2] - box_a[0], box_a[3] - box_a[1],
+                   box_b[2] - box_b[0], box_b[3] - box_b[1])
+    return math.hypot(ca[0] - cb[0], ca[1] - cb[1]) < 0.6 * max(min_side, 1.0)
+
+
 # ---------------------------------------------------------------------------
 # Independent Student Tracker
 # ---------------------------------------------------------------------------
@@ -217,9 +267,14 @@ class StudentTracker:
         self.yaw = 0.0
         self.roll = 0.0
         self.last_pitch = 0.0
+        self.upright_pitch = None      # learned upright head pitch for this student
+        self.head_drop = 0.0           # degrees below upright_pitch (smoothed)
+        self.head_dropped = False
+        self.pitch_history_recent = deque(maxlen=15)
 
         self.ear_history = deque(maxlen=PERCLOS_WINDOW_SIZE)
-        self.closed_history = deque(maxlen=PERCLOS_WINDOW_SIZE)
+        self.closed_history = deque(maxlen=PERCLOS_WINDOW_SIZE)       # gated by head drop
+        self.closed_raw_history = deque(maxlen=PERCLOS_WINDOW_SIZE)   # eyes/posture, ungated
         self.pitch_history = deque(maxlen=PERCLOS_WINDOW_SIZE)
 
         self.status = "AWAKE"
@@ -267,33 +322,50 @@ class StudentTracker:
         self.ear_history.append(ear)
         self.pitch_history.append(pitch)
 
+        # Head-drop tracking: how far has this student's head sagged from their own
+        # upright posture? (the reference only rises while upright, so a student who
+        # stays slumped keeps counting as dropped)
+        self.pitch_history_recent.append(pitch)
+        smooth_pitch = float(np.mean(self.pitch_history_recent))
+        if self.upright_pitch is None:
+            if len(self.pitch_history) >= HEAD_BASELINE_FRAMES:
+                self.upright_pitch = float(np.median(list(self.pitch_history)[:HEAD_BASELINE_FRAMES]))
+        else:
+            if smooth_pitch > self.upright_pitch - HEAD_DROP_DEG / 2.0:
+                self.upright_pitch = 0.98 * self.upright_pitch + 0.02 * smooth_pitch
+        if self.upright_pitch is None:
+            self.head_drop = 0.0
+        else:
+            self.head_drop = self.upright_pitch - smooth_pitch
+        self.head_dropped = self.head_drop >= HEAD_DROP_DEG
+
+        eyes_count = self.head_dropped or not REQUIRE_HEAD_DROP_FOR_EYES
+
         # Instantaneous closed/slouching condition
         relative_pitch = pitch - self.baseline_pitch if self.baseline_pitch != 0.0 else pitch
-        is_closed_or_slouching = (ear < EAR_CLOSED_THRESHOLD) or (relative_pitch < PITCH_DOWN_THRESHOLD)
+        is_closed_or_slouching = ((ear < EAR_CLOSED_THRESHOLD) and eyes_count) or (relative_pitch < PITCH_DOWN_THRESHOLD)
         self.closed_history.append(is_closed_or_slouching)
+        self.closed_raw_history.append((ear < EAR_CLOSED_THRESHOLD) or (relative_pitch < PITCH_DOWN_THRESHOLD))
 
         # Calculate PERCLOS over window
-        self.perclos = sum(self.closed_history) / max(len(self.closed_history), 1)
+        # While the head is sagging, the recent eye closure counts retroactively
+        # (eyes closed for a while, THEN head dropped = falling asleep). While the head
+        # is upright, lowered eyes are ignored (reading / looking down).
+        hist = self.closed_raw_history if (self.head_dropped or not REQUIRE_HEAD_DROP_FOR_EYES) else self.closed_history
+        self.perclos = sum(hist) / max(len(hist), 1)
 
         # Drowsiness confidence score calculation
-        ear_score = max(0.0, (EAR_OPEN_THRESHOLD - ear) / EAR_OPEN_THRESHOLD)
+        ear_score = max(0.0, (EAR_OPEN_THRESHOLD - ear) / EAR_OPEN_THRESHOLD) if eyes_count else 0.0
         pitch_score = max(0.0, (-pitch) / 30.0) if pitch < 0 else 0.0
         combined_instant = min(1.0, max(ear_score, pitch_score))
         self.score = float(np.clip((0.6 * self.perclos + 0.4 * combined_instant) * 100.0, 0.0, 100.0))
 
-        # Temporal Hysteresis State Machine
-        if is_closed_or_slouching or self.perclos >= PERCLOS_DROWSY_RATIO:
-            self.drowsy_counter += 1
-            self.awake_counter = 0
-        else:
-            self.awake_counter += 1
-            self.drowsy_counter = 0
-
+        # Score-based state machine with hysteresis
         if self.status == "AWAKE":
-            if self.drowsy_counter >= CONSECUTIVE_DROWSY_FRAMES or self.perclos >= PERCLOS_DROWSY_RATIO:
+            if len(self.closed_history) >= MIN_FRAMES_FOR_DECISION and self.score >= SCORE_DROWSY_THRESHOLD:
                 self.status = "DROWSY"
         else:  # DROWSY or SEVERE SLOUCH
-            if self.awake_counter >= CONSECUTIVE_AWAKE_FRAMES and self.perclos < PERCLOS_AWAKE_RATIO:
+            if self.score < SCORE_AWAKE_THRESHOLD:
                 self.status = "AWAKE"
 
         return self.status
@@ -359,21 +431,14 @@ class DrowsinessDetector:
 
     def __init__(self):
         ensure_model()
-        BaseOptions = mp.tasks.BaseOptions
-        FaceLandmarker = mp.tasks.vision.FaceLandmarker
-        FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
-        VisionRunningMode = mp.tasks.vision.RunningMode
-
-        # High-accuracy multi-face sensitivity options
-        options = FaceLandmarkerOptions(
-            base_options=BaseOptions(model_asset_path=str(MODEL_PATH)),
-            running_mode=VisionRunningMode.IMAGE,
-            num_faces=15,
-            min_face_detection_confidence=0.30,
-            min_face_presence_confidence=0.30,
-            min_tracking_confidence=0.30,
-        )
-        self.landmarker = FaceLandmarker.create_from_options(options)
+        self.landmarker = self._make_landmarker()
+        # Second landmarker (own state) used by the background discovery scan,
+        # because a MediaPipe task object must not be shared between threads.
+        self.scan_landmarker = self._make_landmarker()
+        self._scan_lock = threading.Lock()
+        self._scan_thread = None
+        self._scan_results = []
+        self._roi_cache = {}   # student_id -> (frame_id, pts_px)
 
         # OpenCV Haar Cascade fallback detector
         self.cascade_detector = cv2.CascadeClassifier(CASCADE_PATH)
@@ -384,46 +449,184 @@ class DrowsinessDetector:
         self.global_alarm_counter = 0
         self.global_alarm_active = False
 
+    @staticmethod
+    def _make_landmarker():
+        BaseOptions = mp.tasks.BaseOptions
+        FaceLandmarker = mp.tasks.vision.FaceLandmarker
+        FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
+        VisionRunningMode = mp.tasks.vision.RunningMode
+        options = FaceLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=str(MODEL_PATH)),
+            running_mode=VisionRunningMode.IMAGE,
+            num_faces=15,
+            min_face_detection_confidence=0.30,
+            min_face_presence_confidence=0.30,
+            min_tracking_confidence=0.30,
+        )
+        return FaceLandmarker.create_from_options(options)
+
+    def close(self):
+        """Release both landmarkers (waits briefly for a running scan)."""
+        t = self._scan_thread
+        if t is not None and t.is_alive():
+            t.join(timeout=5.0)
+        self.landmarker.close()
+        self.scan_landmarker.close()
+
+    def _start_background_scan(self, frame_bgr):
+        if self._scan_thread is not None and self._scan_thread.is_alive():
+            return
+        frame_copy = frame_bgr.copy()
+
+        def worker():
+            try:
+                found = self._scan_tiles(frame_copy, self.scan_landmarker)
+            except Exception as exc:   # never let the scanner kill the video
+                print(f"Discovery scan failed: {exc}")
+                found = []
+            with self._scan_lock:
+                self._scan_results = found
+
+        self._scan_thread = threading.Thread(target=worker, daemon=True)
+        self._scan_thread.start()
+
+    def _collect_scan_results(self):
+        with self._scan_lock:
+            found, self._scan_results = self._scan_results, []
+        return found
+
+    # ------------------------------------------------------------------
+    # Face detection helpers (full frame / tracked ROI / tiled scan)
+    # ------------------------------------------------------------------
+    def _detect_pts(self, bgr, offset=(0.0, 0.0), scale=1.0, landmarker=None):
+        """
+        Run the landmarker on `bgr` and return a list of (468+, 3) pixel arrays
+        expressed in ORIGINAL-frame coordinates (offset = crop origin in the
+        original frame, scale = how much the crop was enlarged).
+        """
+        ih, iw = bgr.shape[:2]
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        result = (landmarker or self.landmarker).detect(
+            mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
+        )
+        out = []
+        if not result or not result.face_landmarks:
+            return out
+        for lms in result.face_landmarks:
+            pts = np.array([
+                [lm.x * iw / scale + offset[0],
+                 lm.y * ih / scale + offset[1],
+                 lm.z * iw / scale] for lm in lms
+            ], dtype=np.float64)
+            out.append(pts)
+        return out
+
+    def _detect_in_roi(self, frame_bgr, bbox):
+        """Re-detect one known face inside an upscaled crop around its last bbox."""
+        h, w = frame_bgr.shape[:2]
+        x1, y1, x2, y2 = bbox
+        fw, fh = max(1, x2 - x1), max(1, y2 - y1)
+        side = max(fw, fh) * (1.0 + 2.0 * ROI_MARGIN)
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        rx1 = int(max(0, cx - side / 2)); rx2 = int(min(w, cx + side / 2))
+        ry1 = int(max(0, cy - side / 2)); ry2 = int(min(h, cy + side / 2))
+        if rx2 - rx1 < 16 or ry2 - ry1 < 16:
+            return None
+        crop = frame_bgr[ry1:ry2, rx1:rx2]
+        scale = ROI_INPUT_SIZE / float(max(crop.shape[:2]))
+        crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+        for attempt in (crop, enhance_illumination(crop)):   # 2nd try: CLAHE for shadows
+            found = self._detect_pts(attempt, offset=(rx1, ry1), scale=scale)
+            if found:
+                # choose the face closest to where we expect the student to be
+                found.sort(key=lambda p: math.hypot(
+                    (p[:, 0].min() + p[:, 0].max()) / 2.0 - cx,
+                    (p[:, 1].min() + p[:, 1].max()) / 2.0 - cy))
+                return found[0]
+        return None
+
+    def _scan_tiles(self, frame_bgr, landmarker=None):
+        """Multi-scale tiled scan: finds small faces the whole-frame pass misses."""
+        h, w = frame_bgr.shape[:2]
+        found = []
+        for frac in TILE_FRACTIONS:
+            tile = int(min(max(128, w * frac), w, h))
+            step = max(1, int(tile * (1.0 - TILE_OVERLAP)))
+            xs = list(range(0, max(1, w - tile + 1), step))
+            ys = list(range(0, max(1, h - tile + 1), step))
+            if xs[-1] != w - tile: xs.append(w - tile)
+            if ys[-1] != h - tile: ys.append(h - tile)
+            scale = TILE_INPUT_SIZE / float(tile)
+            margin = 0.02 * tile
+            for ty in ys:
+                for tx in xs:
+                    crop = frame_bgr[ty:ty + tile, tx:tx + tile]
+                    crop = cv2.resize(crop, None, fx=scale, fy=scale,
+                                      interpolation=cv2.INTER_CUBIC)
+                    for pts in self._detect_pts(crop, offset=(tx, ty), scale=scale, landmarker=landmarker):
+                        bx1, by1, bx2, by2 = _face_box(pts)
+                        bw, bh = bx2 - bx1, by2 - by1
+                        if bw < MIN_FACE_PX or bh < MIN_FACE_PX:
+                            continue
+                        if not (0.5 <= bw / bh <= 1.5):          # implausible shape
+                            continue
+                        # drop faces cut off by an interior tile border
+                        if ((bx1 - tx < margin and tx > 0) or
+                                (by1 - ty < margin and ty > 0) or
+                                (tx + tile - bx2 < margin and tx + tile < w) or
+                                (ty + tile - by2 < margin and ty + tile < h)):
+                            continue
+                        box = (bx1, by1, bx2, by2)
+                        if not any(_is_duplicate_face(box, _face_box(p)) for p in found):
+                            found.append(pts)
+        return found
+
     def process_frame(self, frame_bgr):
         self.frame_count += 1
         h, w = frame_bgr.shape[:2]
         display = frame_bgr.copy()
 
-        # Pass 1: Standard RGB landmark detection
-        rgb_frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        mp_image1 = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-        detection_result1 = self.landmarker.detect(mp_image1)
-        faces_landmarks = list(detection_result1.face_landmarks) if (detection_result1 and detection_result1.face_landmarks) else []
+        # Pass A: whole-frame detection (fast; finds large / close faces)
+        faces_pts = self._detect_pts(frame_bgr)
 
-        # Retry on enhanced frames when no face is found or tracked faces are missing.
-        if not faces_landmarks or len(faces_landmarks) < len(self.trackers):
-            enhanced_bgr = enhance_illumination(frame_bgr)
-            enhanced_rgb = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2RGB)
-            mp_image2 = mp.Image(image_format=mp.ImageFormat.SRGB, data=enhanced_rgb)
-            detection_result2 = self.landmarker.detect(mp_image2)
-            if detection_result2 and detection_result2.face_landmarks:
-                for new_landmarks in detection_result2.face_landmarks:
-                    # Deduplicate overlapping faces
-                    new_pts = np.array([[lm.x * w, lm.y * h] for lm in new_landmarks])
-                    new_cx, new_cy = np.mean(new_pts[:, 0]), np.mean(new_pts[:, 1])
-                    
-                    is_dup = False
-                    for existing in faces_landmarks:
-                        ex_pts = np.array([[lm.x * w, lm.y * h] for lm in existing])
-                        ex_cx, ex_cy = np.mean(ex_pts[:, 0]), np.mean(ex_pts[:, 1])
-                        if math.hypot(new_cx - ex_cx, new_cy - ex_cy) < 40.0:
-                            is_dup = True
-                            break
-                    if not is_dup:
-                        faces_landmarks.append(new_landmarks)
+        # Pass B: follow KNOWN students on an upscaled crop around their last
+        # position. Refreshed every ROI_REFRESH_FRAMES; cached in between.
+        for s_id, tracker in list(self.trackers.items()):
+            if tracker.bbox == (0, 0, 0, 0):
+                continue
+            if any(_is_duplicate_face(_face_box(p), tracker.bbox) for p in faces_pts):
+                self._roi_cache.pop(s_id, None)
+                continue
+            cached = self._roi_cache.get(s_id)
+            # stagger refreshes per student so the cost is spread evenly across frames
+            if cached and self.frame_count - cached[0] < ROI_REFRESH_FRAMES + (s_id % ROI_REFRESH_FRAMES):
+                faces_pts.append(cached[1])
+                continue
+            roi_pts = self._detect_in_roi(frame_bgr, tracker.bbox)
+            if roi_pts is not None:
+                self._roi_cache[s_id] = (self.frame_count, roi_pts)
+                faces_pts.append(roi_pts)
+            else:
+                self._roi_cache.pop(s_id, None)
+
+        # Pass C: tiled scan to DISCOVER small / distant faces.
+        # First frame runs synchronously (instant result); later scans run in a
+        # background thread so playback never stalls.
+        if self.frame_count == 1:
+            discovered = self._scan_tiles(frame_bgr)
+        else:
+            if self.frame_count % DISCOVERY_INTERVAL_FRAMES == 1:
+                self._start_background_scan(frame_bgr)
+            discovered = self._collect_scan_results()
+        for pts in discovered:
+            box = _face_box(pts)
+            if not any(_is_duplicate_face(box, _face_box(p)) for p in faces_pts):
+                faces_pts.append(pts)
 
         current_face_data = []
 
-        for landmarks in faces_landmarks:
-            # Convert normalized landmarks to pixel coordinates
-            pts_px = np.array([
-                [lm.x * w, lm.y * h, lm.z * w] for lm in landmarks
-            ], dtype=np.float64)
+        for pts_px in faces_pts:
 
             # Bounding box
             min_x, max_x = int(np.min(pts_px[:, 0])), int(np.max(pts_px[:, 0]))
@@ -540,6 +743,7 @@ class DrowsinessDetector:
 
         for s_id in stale_ids:
             del self.trackers[s_id]
+            self._roi_cache.pop(s_id, None)
 
         # Aggregate Classroom Drowsiness Statistics
         detected_count = len(active_student_states)
@@ -661,6 +865,6 @@ class DrowsinessDetector:
             cv2.rectangle(banner, (0, 0), (w, 48), (0, 0, 180), -1)
             cv2.addWeighted(banner, 0.70, display, 0.30, 0, display)
             cv2.putText(
-                display, "ALERT: CLASSROOM DROWSINESS EXCEEDS 50%!",
+                display, "ALERT: CLASSROOM DROWSINESS EXCEEDS 40%!",
                 (16, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 230, 80), 2, cv2.LINE_AA
             )

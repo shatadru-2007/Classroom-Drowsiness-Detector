@@ -233,7 +233,7 @@ def _process_uploaded_video(video_path: Path):
         if capture is not None:
             capture.release()
         if detector is not None:
-            detector.landmarker.close()
+            detector.close()
         if _video_stop_event.is_set():
             with _video_state_lock:
                 _video_state.update({"status": "stopped", "alarm": False})
