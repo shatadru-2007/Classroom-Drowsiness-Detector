@@ -1,0 +1,676 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Classroom Drowsiness Detector</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <style>
+    /* ───── Reset & Tokens ───── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0b0d14;
+      --surface:   #12151f;
+      --card:      #181c2a;
+      --border:    #252a3d;
+      --accent:    #6c8af5;
+      --accent2:   #8b5cf6;
+      --awake:     #22c55e;
+      --drowsy:    #ef4444;
+      --warn:      #f59e0b;
+      --text:      #e2e8f0;
+      --muted:     #64748b;
+      --radius:    12px;
+      --radius-sm: 8px;
+    }
+
+    html, body {
+      height: 100%;
+      font-family: 'Inter', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      overflow: hidden;
+    }
+
+    /* ───── Layout ───── */
+    .shell {
+      display: grid;
+      grid-template-rows: 52px 1fr;
+      grid-template-columns: 1fr 300px;
+      height: 100vh;
+      gap: 0;
+    }
+
+    /* ───── Header ───── */
+    header {
+      grid-column: 1 / -1;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 0 20px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      position: relative;
+      z-index: 10;
+    }
+
+    .logo-icon {
+      width: 28px; height: 28px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 14px;
+      flex-shrink: 0;
+    }
+
+    header h1 {
+      font-size: 15px; font-weight: 600;
+      background: linear-gradient(90deg, var(--accent), var(--accent2));
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+      background-clip: text;
+      letter-spacing: 0.02em;
+    }
+
+    .header-badges {
+      display: flex; gap: 8px; margin-left: auto;
+    }
+
+    .badge {
+      display: flex; align-items: center; gap: 5px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 11px; font-weight: 500;
+      border: 1px solid var(--border);
+      background: var(--card);
+    }
+
+    .badge .dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: var(--muted);
+      transition: background 0.3s;
+    }
+
+    .badge.live .dot  { background: var(--awake); animation: pulse-dot 1.4s infinite; }
+    .badge.alarm-badge .dot { background: var(--drowsy); animation: pulse-dot 0.7s infinite; }
+
+    @keyframes pulse-dot {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.3; }
+    }
+
+    .header-btns {
+      display: flex; gap: 8px; margin-left: 16px;
+    }
+
+    .btn {
+      display: flex; align-items: center; gap: 6px;
+      padding: 5px 12px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border);
+      background: var(--card);
+      color: var(--text);
+      font-family: inherit; font-size: 12px; font-weight: 500;
+      cursor: pointer;
+      transition: background 0.2s, border-color 0.2s, transform 0.1s;
+    }
+    .btn:hover { background: var(--border); border-color: var(--accent); }
+    .btn:active { transform: scale(0.96); }
+
+    .btn-danger { border-color: #7f1d1d; }
+    .btn-danger:hover { background: #7f1d1d40; border-color: var(--drowsy); }
+
+    /* ───── Main feed area ───── */
+    .feed-area {
+      position: relative;
+      background: #000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+
+    #feed {
+      width: 100%; height: 100%;
+      object-fit: contain;
+      display: block;
+    }
+
+    /* Offline placeholder */
+    .feed-placeholder {
+      position: absolute; inset: 0;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      gap: 12px;
+      background: var(--surface);
+    }
+    .feed-placeholder .spinner {
+      width: 40px; height: 40px;
+      border: 3px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.9s linear infinite;
+    }
+    .feed-placeholder p { color: var(--muted); font-size: 13px; }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Alarm overlay on feed */
+    .alarm-overlay {
+      position: absolute; inset: 0;
+      border: 5px solid var(--drowsy);
+      border-radius: 0;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 0.3s;
+      box-shadow: inset 0 0 60px #ef444440;
+    }
+    .alarm-overlay.active { opacity: 1; animation: alarm-pulse 0.9s ease-in-out infinite alternate; }
+
+    @keyframes alarm-pulse {
+      from { border-color: #ef4444; box-shadow: inset 0 0 40px #ef444430; }
+      to   { border-color: #fca5a5; box-shadow: inset 0 0 80px #ef444460; }
+    }
+
+    /* ───── Sidebar ───── */
+    .sidebar {
+      background: var(--surface);
+      border-left: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .sidebar-section {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .section-label {
+      font-size: 10px; font-weight: 600; letter-spacing: 0.1em;
+      text-transform: uppercase; color: var(--muted);
+      margin-bottom: 10px;
+    }
+
+    /* ───── Stats Grid ───── */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+
+    .stat-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 10px 12px;
+      transition: border-color 0.3s;
+    }
+
+    .stat-card .stat-val {
+      font-size: 26px; font-weight: 700;
+      font-family: 'JetBrains Mono', monospace;
+      line-height: 1;
+    }
+
+    .stat-card .stat-label {
+      font-size: 10px; font-weight: 500;
+      color: var(--muted); margin-top: 4px;
+      text-transform: uppercase; letter-spacing: 0.06em;
+    }
+
+    .stat-card.s-detected .stat-val { color: var(--accent); }
+    .stat-card.s-drowsy   .stat-val { color: var(--drowsy); }
+    .stat-card.s-awake    .stat-val { color: var(--awake); }
+    .stat-card.s-ratio    .stat-val { color: var(--warn); }
+
+    /* ───── Ratio Arc ───── */
+    .ratio-wrap {
+      display: flex; align-items: center; gap: 14px;
+      padding: 4px 0 8px;
+    }
+
+    .arc-svg { flex-shrink: 0; }
+
+    .ratio-info { flex: 1; }
+    .ratio-pct {
+      font-size: 36px; font-weight: 700;
+      font-family: 'JetBrains Mono', monospace;
+      line-height: 1;
+    }
+    .ratio-sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+    /* ───── Alarm Banner (sidebar) ───── */
+    .alarm-banner {
+      display: flex; align-items: center; gap: 10px;
+      padding: 10px 12px;
+      border-radius: var(--radius-sm);
+      background: #450a0a;
+      border: 1px solid #7f1d1d;
+      font-size: 12px; font-weight: 600;
+      color: #fca5a5;
+      opacity: 0;
+      transform: translateY(-4px);
+      transition: opacity 0.3s, transform 0.3s;
+      pointer-events: none;
+    }
+    .alarm-banner.visible {
+      opacity: 1;
+      transform: translateY(0);
+      pointer-events: auto;
+      animation: banner-shake 0.4s ease;
+    }
+    .alarm-icon { font-size: 16px; animation: alarm-icon-spin 2s linear infinite; }
+
+    @keyframes banner-shake {
+      0%,100% { transform: translateX(0); }
+      25%      { transform: translateX(-4px); }
+      75%      { transform: translateX(4px); }
+    }
+    @keyframes alarm-icon-spin {
+      0%,100% { transform: rotate(-10deg); }
+      50%     { transform: rotate(10deg); }
+    }
+
+    /* ───── Student list ───── */
+    .students-scroll {
+      flex: 1; overflow-y: auto;
+      padding: 10px 16px 16px;
+    }
+
+    .students-scroll::-webkit-scrollbar { width: 4px; }
+    .students-scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+    .no-students {
+      color: var(--muted); font-size: 12px;
+      text-align: center; margin-top: 24px;
+    }
+
+    .student-card {
+      display: flex; align-items: center; gap: 10px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 9px 12px;
+      margin-bottom: 6px;
+      transition: border-color 0.3s, background 0.3s;
+      animation: card-in 0.25s ease;
+    }
+
+    @keyframes card-in {
+      from { opacity: 0; transform: translateX(8px); }
+      to   { opacity: 1; transform: translateX(0); }
+    }
+
+    .student-card.drowsy-card {
+      border-color: #7f1d1d;
+      background: #1a0b0b;
+    }
+    .student-card.awake-card {
+      border-color: #14532d;
+      background: #0b1a0f;
+    }
+
+    .student-avatar {
+      width: 30px; height: 30px;
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 13px; font-weight: 700;
+      flex-shrink: 0;
+    }
+    .drowsy-card .student-avatar { background: #7f1d1d; color: #fca5a5; }
+    .awake-card  .student-avatar { background: #14532d; color: #86efac; }
+
+    .student-info { flex: 1; min-width: 0; }
+    .student-name { font-size: 12px; font-weight: 600; }
+    .student-status { font-size: 11px; color: var(--muted); margin-top: 1px; }
+
+    .student-score {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px; font-weight: 600;
+    }
+    .drowsy-card .student-score { color: var(--drowsy); }
+    .awake-card  .student-score { color: var(--awake); }
+
+    /* ───── Notification toast ───── */
+    #toast-container {
+      position: fixed;
+      bottom: 20px; left: 50%;
+      transform: translateX(-50%);
+      z-index: 9999;
+      display: flex; flex-direction: column; gap: 8px;
+      pointer-events: none;
+      width: 340px;
+    }
+
+    .toast {
+      background: var(--card);
+      border: 1px solid var(--drowsy);
+      border-radius: var(--radius);
+      padding: 12px 16px;
+      display: flex; align-items: flex-start; gap: 10px;
+      animation: toast-in 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
+      box-shadow: 0 8px 32px #00000060;
+    }
+
+    .toast.out { animation: toast-out 0.3s ease forwards; }
+
+    @keyframes toast-in {
+      from { opacity: 0; transform: translateY(20px) scale(0.95); }
+      to   { opacity: 1; transform: translateY(0) scale(1); }
+    }
+    @keyframes toast-out {
+      to { opacity: 0; transform: translateY(10px) scale(0.95); }
+    }
+
+    .toast-icon { font-size: 20px; flex-shrink: 0; margin-top: 1px; }
+    .toast-body .toast-title { font-size: 13px; font-weight: 600; color: #fca5a5; }
+    .toast-body .toast-msg   { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  </style>
+</head>
+<body>
+<div class="shell">
+
+  <!-- ── Header ── -->
+  <header>
+    <div class="logo-icon">👁️</div>
+    <h1>Classroom Drowsiness Detector</h1>
+
+    <div class="header-badges">
+      <span class="badge live" id="badge-live">
+        <span class="dot"></span> Live
+      </span>
+      <span class="badge alarm-badge" id="badge-alarm" style="display:none">
+        <span class="dot"></span> ALARM
+      </span>
+    </div>
+
+    <div class="header-btns">
+      <button class="btn" id="btn-snapshot" title="Save snapshot">
+        📷 Snapshot
+      </button>
+      <button class="btn btn-danger" id="btn-reset" title="Reset alarm state">
+        🔕 Reset Alarm
+      </button>
+      <button class="btn" id="btn-notif" title="Enable notifications">
+        🔔 Allow Alerts
+      </button>
+    </div>
+  </header>
+
+  <!-- ── Feed ── -->
+  <div class="feed-area" id="feed-area">
+    <div class="feed-placeholder" id="feed-placeholder">
+      <div class="spinner"></div>
+      <p>Connecting to camera…</p>
+    </div>
+    <img id="feed" src="/video_feed" alt="Live classroom feed"
+         style="display:none"
+         onload="document.getElementById('feed-placeholder').style.display='none';
+                 document.getElementById('feed').style.display='block';" />
+    <div class="alarm-overlay" id="alarm-overlay"></div>
+  </div>
+
+  <!-- ── Sidebar ── -->
+  <aside class="sidebar">
+
+    <!-- Stats -->
+    <div class="sidebar-section">
+      <div class="section-label">Live Statistics</div>
+      <div class="stats-grid">
+        <div class="stat-card s-detected">
+          <div class="stat-val" id="stat-detected">0</div>
+          <div class="stat-label">Detected</div>
+        </div>
+        <div class="stat-card s-drowsy">
+          <div class="stat-val" id="stat-drowsy">0</div>
+          <div class="stat-label">Drowsy</div>
+        </div>
+        <div class="stat-card s-awake">
+          <div class="stat-val" id="stat-awake">0</div>
+          <div class="stat-label">Awake</div>
+        </div>
+        <div class="stat-card s-ratio">
+          <div class="stat-val" id="stat-ratio">0%</div>
+          <div class="stat-label">Drowsy %</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Ratio arc -->
+    <div class="sidebar-section">
+      <div class="section-label">Drowsiness Ratio</div>
+      <div class="ratio-wrap">
+        <svg class="arc-svg" width="80" height="80" viewBox="0 0 80 80">
+          <circle cx="40" cy="40" r="32" fill="none" stroke="#252a3d" stroke-width="7"/>
+          <circle id="arc-ring" cx="40" cy="40" r="32" fill="none"
+                  stroke="#6c8af5" stroke-width="7"
+                  stroke-linecap="round"
+                  stroke-dasharray="201.06"
+                  stroke-dashoffset="201.06"
+                  transform="rotate(-90 40 40)"
+                  style="transition: stroke-dashoffset 0.5s ease, stroke 0.5s ease;"/>
+        </svg>
+        <div class="ratio-info">
+          <div class="ratio-pct" id="ratio-pct">0%</div>
+          <div class="ratio-sub" id="ratio-sub">No faces detected</div>
+        </div>
+      </div>
+
+      <!-- Alarm banner -->
+      <div class="alarm-banner" id="alarm-banner">
+        <span class="alarm-icon">🚨</span>
+        <span>ALERT: &gt;50% students drowsy!</span>
+      </div>
+    </div>
+
+    <!-- Per-student cards -->
+    <div class="sidebar-section" style="border-bottom:none; padding-bottom:4px;">
+      <div class="section-label">Students</div>
+    </div>
+    <div class="students-scroll" id="students-list">
+      <div class="no-students" id="no-students">No students detected yet</div>
+    </div>
+
+  </aside>
+</div>
+
+<!-- Toast container -->
+<div id="toast-container"></div>
+
+<script>
+  // ── Notification permission ──────────────────────────────────────────────
+  const btnNotif = document.getElementById('btn-notif');
+  let notifGranted = Notification.permission === 'granted';
+  if (notifGranted) btnNotif.style.display = 'none';
+
+  btnNotif.addEventListener('click', async () => {
+    const perm = await Notification.requestPermission();
+    notifGranted = perm === 'granted';
+    if (notifGranted) btnNotif.style.display = 'none';
+  });
+
+  // ── SSE Stats ────────────────────────────────────────────────────────────
+  const arcCircumference = 2 * Math.PI * 32; // 201.06
+  const arcRing      = document.getElementById('arc-ring');
+  const statDetected = document.getElementById('stat-detected');
+  const statDrowsy   = document.getElementById('stat-drowsy');
+  const statAwake    = document.getElementById('stat-awake');
+  const statRatio    = document.getElementById('stat-ratio');
+  const ratioPct     = document.getElementById('ratio-pct');
+  const ratioSub     = document.getElementById('ratio-sub');
+  const alarmOverlay = document.getElementById('alarm-overlay');
+  const alarmBanner  = document.getElementById('alarm-banner');
+  const badgeAlarm   = document.getElementById('badge-alarm');
+  const studentsList = document.getElementById('students-list');
+  const noStudents   = document.getElementById('no-students');
+
+  let lastAlarmState = false;
+
+  function updateUI(data) {
+    statDetected.textContent = data.detected ?? 0;
+    statDrowsy.textContent   = data.drowsy   ?? 0;
+    statAwake.textContent    = data.awake    ?? 0;
+
+    const pct = data.percentage ?? 0;
+    statRatio.textContent = pct.toFixed(1) + '%';
+    ratioPct.textContent  = pct.toFixed(1) + '%';
+
+    // Arc
+    const filled = (pct / 100) * arcCircumference;
+    arcRing.style.strokeDashoffset = arcCircumference - filled;
+
+    if (pct > 50) {
+      arcRing.style.stroke = '#ef4444';
+      ratioPct.style.color = '#ef4444';
+    } else if (pct > 25) {
+      arcRing.style.stroke = '#f59e0b';
+      ratioPct.style.color = '#f59e0b';
+    } else {
+      arcRing.style.stroke = '#6c8af5';
+      ratioPct.style.color = '';
+    }
+
+    // Ratio subtitle
+    const det = data.detected ?? 0;
+    const dry = data.drowsy   ?? 0;
+    ratioSub.textContent = det > 0
+      ? `${dry} of ${det} student${det !== 1 ? 's' : ''} drowsy`
+      : 'No faces detected';
+
+    // Alarm state
+    const alarm = !!data.alarm;
+    alarmOverlay.classList.toggle('active', alarm);
+    alarmBanner.classList.toggle('visible', alarm);
+    badgeAlarm.style.display = alarm ? 'flex' : 'none';
+
+    if (alarm && !lastAlarmState) {
+      fireAlarmNotification(dry, det, pct);
+    }
+    lastAlarmState = alarm;
+
+    // Student cards
+    const faces = data.faces ?? [];
+    if (faces.length === 0) {
+      noStudents.style.display = 'block';
+      // Clear old cards
+      [...studentsList.querySelectorAll('.student-card')].forEach(c => c.remove());
+    } else {
+      noStudents.style.display = 'none';
+      renderStudentCards(faces);
+    }
+  }
+
+  function renderStudentCards(faces) {
+    const existing = studentsList.querySelectorAll('.student-card');
+    const existingIds = new Set([...existing].map(c => c.dataset.id));
+    const newIds = new Set(faces.map(f => String(f.id)));
+
+    // Remove stale cards
+    existing.forEach(c => {
+      if (!newIds.has(c.dataset.id)) c.remove();
+    });
+
+    // Update or add
+    faces.forEach(f => {
+      const isDrowsy = f.status === 'DROWSY';
+      const id = String(f.id);
+      let card = studentsList.querySelector(`.student-card[data-id="${id}"]`);
+
+      if (!card) {
+        card = document.createElement('div');
+        card.className = 'student-card';
+        card.dataset.id = id;
+        card.innerHTML = `
+          <div class="student-avatar">${f.id}</div>
+          <div class="student-info">
+            <div class="student-name">${f.label}</div>
+            <div class="student-status"></div>
+          </div>
+          <div class="student-score"></div>`;
+        studentsList.appendChild(card);
+      }
+
+      card.className = `student-card ${isDrowsy ? 'drowsy-card' : 'awake-card'}`;
+      card.querySelector('.student-status').textContent = f.status;
+      card.querySelector('.student-score').textContent  = f.score.toFixed(1) + '%';
+    });
+  }
+
+  // ── Toast & Browser Notification ─────────────────────────────────────────
+  const toastContainer = document.getElementById('toast-container');
+  let lastToastTime = 0;
+
+  function fireAlarmNotification(drowsy, total, pct) {
+    const now = Date.now();
+    if (now - lastToastTime < 8000) return; // debounce 8 s
+    lastToastTime = now;
+
+    const msg = `${drowsy} / ${total} students (${pct.toFixed(0)}%) are drowsy!`;
+
+    // In-page toast
+    showToast('🚨 Drowsiness Alert', msg);
+
+    // Browser notification
+    if (notifGranted) {
+      new Notification('⚠️ Classroom Drowsiness Alert', {
+        body: msg,
+        icon: '',
+        tag: 'drowsiness-alert',
+      });
+    }
+  }
+
+  function showToast(title, message) {
+    const el = document.createElement('div');
+    el.className = 'toast';
+    el.innerHTML = `
+      <div class="toast-icon">🚨</div>
+      <div class="toast-body">
+        <div class="toast-title">${title}</div>
+        <div class="toast-msg">${message}</div>
+      </div>`;
+    toastContainer.prepend(el);
+
+    setTimeout(() => {
+      el.classList.add('out');
+      el.addEventListener('animationend', () => el.remove(), { once: true });
+    }, 6000);
+  }
+
+  // ── SSE connection ────────────────────────────────────────────────────────
+  function connectSSE() {
+    const es = new EventSource('/stats');
+    es.onmessage = e => {
+      try { updateUI(JSON.parse(e.data)); } catch(_) {}
+    };
+    es.onerror = () => {
+      es.close();
+      setTimeout(connectSSE, 3000); // reconnect
+    };
+  }
+  connectSSE();
+
+  // ── Buttons ───────────────────────────────────────────────────────────────
+  document.getElementById('btn-reset').addEventListener('click', async () => {
+    await fetch('/reset', { method: 'POST' });
+    showToast('Alarm Reset', 'Alarm state has been cleared.');
+  });
+
+  document.getElementById('btn-snapshot').addEventListener('click', () => {
+    window.location.href = '/snapshot';
+  });
+
+  // Request notification permission proactively after 1 s
+  setTimeout(async () => {
+    if (Notification.permission === 'default') {
+      const perm = await Notification.requestPermission();
+      notifGranted = perm === 'granted';
+      if (notifGranted) btnNotif.style.display = 'none';
+    }
+  }, 1000);
+</script>
+</body>
+</html>
