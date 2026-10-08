@@ -491,6 +491,9 @@
       <button class="btn btn-danger" id="btn-reset" title="Reset alarm state">
         🔕 Reset Alarm
       </button>
+      <button class="btn" id="btn-sound" title="Toggle alarm sound">
+        🔊 Sound On
+      </button>
       <button class="btn" id="btn-notif" title="Enable notifications">
         🔔 Allow Alerts
       </button>
@@ -602,6 +605,93 @@
     if (notifGranted) btnNotif.style.display = 'none';
   });
 
+  // ── Alarm sound (Web Audio siren – no audio file needed) ─────────────────
+  const btnSound = document.getElementById('btn-sound');
+  let soundEnabled = true;
+  let audioCtx = null;
+  let sirenOsc = null, sirenGain = null, sirenTimer = null;
+
+  function ensureAudio() {
+    if (!audioCtx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      audioCtx = new AC();
+    }
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    return audioCtx;
+  }
+
+  // Browsers block sound until the user interacts with the page once,
+  // so unlock the audio engine on the first click / key press.
+  ['click', 'keydown', 'touchstart'].forEach(evt =>
+    document.addEventListener(evt, () => ensureAudio(), { once: true })
+  );
+
+  function startSynthSiren() {
+    if (!soundEnabled || sirenOsc) return;
+    const ctx = ensureAudio();
+    if (!ctx) return;
+    sirenOsc  = ctx.createOscillator();
+    sirenGain = ctx.createGain();
+    sirenOsc.type = 'square';
+    sirenOsc.frequency.value = 880;
+    sirenGain.gain.value = 0.0001;
+    sirenOsc.connect(sirenGain).connect(ctx.destination);
+    sirenOsc.start();
+    sirenGain.gain.exponentialRampToValueAtTime(0.25, ctx.currentTime + 0.05); // volume 0.25 (max 1)
+    let high = true;
+    sirenTimer = setInterval(() => {                // two-tone "ee-oo" every 0.45 s
+      high = !high;
+      sirenOsc.frequency.setValueAtTime(high ? 880 : 620, ctx.currentTime);
+    }, 450);
+  }
+
+  function stopSynthSiren() {
+    if (sirenTimer) { clearInterval(sirenTimer); sirenTimer = null; }
+    if (sirenOsc) {
+      const osc = sirenOsc, gain = sirenGain, ctx = audioCtx;
+      sirenOsc = sirenGain = null;
+      try {
+        gain.gain.cancelScheduledValues(ctx.currentTime);
+        gain.gain.setValueAtTime(Math.max(gain.gain.value, 0.0001), ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.08);
+        osc.stop(ctx.currentTime + 0.1);
+      } catch (e) { try { osc.stop(); } catch (_) {} }
+    }
+  }
+
+  // Custom alarm sound file (static/alarm.mp3). Falls back to the synthesized siren
+  // above if the file is missing or cannot be played.
+  const alarmAudio = new Audio('/static/alarm.mp3');
+  alarmAudio.loop = true;
+  alarmAudio.preload = 'auto';
+  alarmAudio.volume = 1.0;               // 0.0 - 1.0
+  let alarmFileOk = true;
+  alarmAudio.addEventListener('error', () => { alarmFileOk = false; });
+
+  function startSiren() {
+    if (!soundEnabled) return;
+    if (!alarmFileOk) { startSynthSiren(); return; }
+    if (!alarmAudio.paused) return;
+    const p = alarmAudio.play();
+    if (p && p.catch) p.catch(() => { alarmFileOk = false; if (lastAlarmState) startSynthSiren(); });
+  }
+
+  function stopSiren() {
+    alarmAudio.pause();
+    alarmAudio.currentTime = 0;
+    stopSynthSiren();
+  }
+
+  function setSiren(on) { on ? startSiren() : stopSiren(); }
+
+  btnSound.addEventListener('click', () => {
+    soundEnabled = !soundEnabled;
+    btnSound.textContent = soundEnabled ? '🔊 Sound On' : '🔇 Sound Off';
+    if (!soundEnabled) stopSiren();
+    else { ensureAudio(); if (lastAlarmState) startSiren(); }
+  });
+
   // ── SSE Stats ────────────────────────────────────────────────────────────
   const arcCircumference = 2 * Math.PI * 32; // 201.06
   const arcRing      = document.getElementById('arc-ring');
@@ -660,6 +750,7 @@
     if (alarm && !lastAlarmState) {
       fireAlarmNotification(dry, det, pct);
     }
+    setSiren(alarm);                       // ring while alarm is active, stop when it clears
     lastAlarmState = alarm;
 
     // Student cards
@@ -903,6 +994,7 @@
   // ── Buttons ───────────────────────────────────────────────────────────────
   document.getElementById('btn-reset').addEventListener('click', async () => {
     await fetch('/reset', { method: 'POST' });
+    stopSiren();
     showToast('Alarm Reset', 'Alarm state has been cleared.');
   });
 

@@ -82,7 +82,7 @@ HEAD_DROP_DEG = 12.0            # degrees below own upright pitch = "head has dr
 HEAD_BASELINE_FRAMES = 30       # frames used to learn each student's upright pitch
 
 ALARM_THRESHOLD_PERCENT = 0.40  # > 40% students drowsy triggers alarm
-ALARM_PERSISTENCE_FRAMES = 90   # ~3 seconds sustained before triggering global alarm
+ALARM_PERSISTENCE_FRAMES = 30   # ~1 second sustained before triggering global alarm
 
 # MediaPipe 468 landmark indices
 # Left eye: [corner_left, top1, top2, corner_right, bot2, bot1]
