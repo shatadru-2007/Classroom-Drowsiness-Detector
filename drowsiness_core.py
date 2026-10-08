@@ -80,9 +80,14 @@ MIN_FRAMES_FOR_DECISION = 30    # warm-up: ignore the score for a new student's 
 REQUIRE_HEAD_DROP_FOR_EYES = True
 HEAD_DROP_DEG = 12.0            # degrees below own upright pitch = "head has dropped"
 HEAD_BASELINE_FRAMES = 30       # frames used to learn each student's upright pitch
+HEAD_SMOOTH_FRAMES = 6          # frames averaged when judging head drop (lower = reacts faster)
+
+# Fast confirmation: eyes closed AND head dropped for this many frames in a row
+# flags the student immediately instead of waiting for the 5 s average to climb.
+FAST_DROWSY_FRAMES = 8          # ~0.3 s at 30 fps
 
 ALARM_THRESHOLD_PERCENT = 0.40  # > 40% students drowsy triggers alarm
-ALARM_PERSISTENCE_FRAMES = 30   # ~1 second sustained before triggering global alarm
+ALARM_PERSISTENCE_FRAMES = 60   # ~2 seconds sustained before triggering global alarm
 
 # MediaPipe 468 landmark indices
 # Left eye: [corner_left, top1, top2, corner_right, bot2, bot1]
@@ -270,7 +275,8 @@ class StudentTracker:
         self.upright_pitch = None      # learned upright head pitch for this student
         self.head_drop = 0.0           # degrees below upright_pitch (smoothed)
         self.head_dropped = False
-        self.pitch_history_recent = deque(maxlen=15)
+        self.pitch_history_recent = deque(maxlen=HEAD_SMOOTH_FRAMES)
+        self.fast_counter = 0
 
         self.ear_history = deque(maxlen=PERCLOS_WINDOW_SIZE)
         self.closed_history = deque(maxlen=PERCLOS_WINDOW_SIZE)       # gated by head drop
@@ -341,6 +347,13 @@ class StudentTracker:
 
         eyes_count = self.head_dropped or not REQUIRE_HEAD_DROP_FOR_EYES
 
+        # Fast confirmation counter (tolerates single-frame landmark noise / blinks)
+        if self.head_dropped and ear < EAR_CLOSED_THRESHOLD:
+            self.fast_counter += 1
+        else:
+            self.fast_counter = max(0, self.fast_counter - 2)
+        fast_confirmed = self.fast_counter >= FAST_DROWSY_FRAMES
+
         # Instantaneous closed/slouching condition
         relative_pitch = pitch - self.baseline_pitch if self.baseline_pitch != 0.0 else pitch
         is_closed_or_slouching = ((ear < EAR_CLOSED_THRESHOLD) and eyes_count) or (relative_pitch < PITCH_DOWN_THRESHOLD)
@@ -359,6 +372,8 @@ class StudentTracker:
         pitch_score = max(0.0, (-pitch) / 30.0) if pitch < 0 else 0.0
         combined_instant = min(1.0, max(ear_score, pitch_score))
         self.score = float(np.clip((0.6 * self.perclos + 0.4 * combined_instant) * 100.0, 0.0, 100.0))
+        if fast_confirmed:
+            self.score = max(self.score, SCORE_DROWSY_THRESHOLD)   # no waiting for the average
 
         # Score-based state machine with hysteresis
         if self.status == "AWAKE":
